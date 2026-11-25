@@ -36,6 +36,10 @@ on:
         description: "Tuning gaming brutal (sched latency, BBR, dll). Matikan kalau bootloop untuk bisect"
         type: boolean
         default: true
+      render_opt:
+        description: "Optimasi render + blur (GPU/devfreq/DMA-BUF, kurangi overhead debug). Matikan kalau ada glitch layar"
+        type: boolean
+        default: true
 
 env:
   KERNEL_NAME: Kaelltzyy-Experimental
@@ -298,6 +302,30 @@ jobs:
           echo "--- diff sched (hanya baris berubah) ---"
           git diff -U0 kernel/sched/ | grep -E '^[+-][^+-]' | head -n 60 || true
 
+      - name: Optimasi render + blur (source devfreq)
+        if: ${{ inputs.render_opt }}
+        run: |
+          python3 - <<'PY'
+          import re
+          def patch(path, pattern, repl, label):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  print(f"::warning::{label}: {path} tidak ada (dilewati)"); return
+              n, k = re.subn(pattern, repl, s)
+              if k == 0:
+                  print(f"::warning::{label}: pola tidak ketemu (dilewati, tidak fatal)"); return
+              open(path, "w").write(n); print(f"OK {label}")
+
+          # Blur = beban GPU + bandwidth RAM. Governor devfreq (GPU/DDR bus) naik frekuensi lebih awal
+          # supaya frame blur/transisi tidak drop, turun tetap cepat saat idle (hemat).
+          f = "drivers/devfreq/governor_simpleondemand.c"
+          patch(f, r"(#define DFSO_UPTHRESHOLD\s*\()\d+(\))", r"\g<1>65\g<2>", "devfreq_upthreshold 65")
+          patch(f, r"(#define DFSO_DOWNDIFFERENCTIAL\s*\()\d+(\))", r"\g<1>8\g<2>", "devfreq_downdiff 8")
+          PY
+          echo "--- driver GPU yang terdeteksi di source ---"
+          grep -rIl -i "config MALI\|config DRM_PANFROST\|config DRM_MSM\|config .*KGSL" drivers --include=Kconfig 2>/dev/null | head -n 5 || true
+
       - name: Info versi kernel
         run: |
           make kernelversion
@@ -405,6 +433,20 @@ jobs:
             scripts/config --file out/.config -d PREEMPT_NONE -d PREEMPT_VOLUNTARY -e PREEMPT
           fi
 
+          # ===== Optimasi render + blur =====
+          if [ "${{ inputs.render_opt }}" = "true" ]; then
+            # devfreq (GPU/DDR bus) + governor ondemand yang sudah dituning di source
+            scripts/config --file out/.config -e PM_DEVFREQ -e DEVFREQ_GOV_SIMPLE_ONDEMAND
+
+            # Matikan overhead debug di jalur buffer grafis (dma-buf/DRM/sync)
+            scripts/config --file out/.config \
+              -d DMA_API_DEBUG -d DMABUF_DEBUG -d DRM_DEBUG_MM -d DRM_DEBUG_SELFTEST \
+              -d DEBUG_ATOMIC_SLEEP -d SW_SYNC -d DEBUG_KMEMLEAK -d PAGE_OWNER
+
+            # Hugepage tidak dipakai buffer GPU, hindari latensi compaction tak perlu saat render
+            scripts/config --file out/.config -d TRANSPARENT_HUGEPAGE
+          fi
+
           # KernelSU-Next (hook pakai kprobe)
           if [ "${{ inputs.ksu_enable }}" = "true" ]; then
             scripts/config --file out/.config -e KSU -e KPROBES -e KPROBE_EVENTS
@@ -424,7 +466,7 @@ jobs:
         run: |
           ls -lh out/arch/arm64/boot/Image
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
-          grep -E '^CONFIG_(HZ|PREEMPT|INIT_ON|ZSMALLOC|MITIGATE_SPECTRE|SCHED_DEBUG|SCHEDSTATS|SCHED_BORE|UCLAMP|CC_OPTIMIZE|LOCALVERSION|LTO_CLANG|CFI_CLANG|MODVERSIONS|KSU|KPROBES|WQ_POWER_EFFICIENT|RCU_BOOST|RCU_EXPERT|ZRAM|CRYPTO_LZ4|TCP_CONG_BBR|DEFAULT_TCP_CONG|DEFAULT_BBR|DEFAULT_NET_SCH|DEFAULT_FQ|NET_SCH_FQ|CONSOLE_LOGLEVEL_DEFAULT|CPU_FREQ_GOV_KAELLTZYY|CPU_FREQ_DEFAULT_GOV|LRU_GEN)' out/.config || true
+          grep -E '^CONFIG_(HZ|PREEMPT|INIT_ON|ZSMALLOC|MITIGATE_SPECTRE|SCHED_DEBUG|SCHEDSTATS|SCHED_BORE|UCLAMP|CC_OPTIMIZE|LOCALVERSION|LTO_CLANG|CFI_CLANG|MODVERSIONS|KSU|KPROBES|WQ_POWER_EFFICIENT|RCU_BOOST|RCU_EXPERT|ZRAM|CRYPTO_LZ4|TCP_CONG_BBR|DEFAULT_TCP_CONG|DEFAULT_BBR|DEFAULT_NET_SCH|DEFAULT_FQ|NET_SCH_FQ|CONSOLE_LOGLEVEL_DEFAULT|CPU_FREQ_GOV_KAELLTZYY|CPU_FREQ_DEFAULT_GOV|LRU_GEN|PM_DEVFREQ|DEVFREQ_GOV|DMA_API_DEBUG|DMABUF_DEBUG|SW_SYNC|TRANSPARENT_HUGEPAGE)' out/.config || true
           cp out/.config kaelltzyy.config
 
       - name: Package AnyKernel3
