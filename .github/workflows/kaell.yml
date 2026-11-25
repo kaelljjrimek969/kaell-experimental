@@ -36,6 +36,14 @@ on:
         description: "Tuning gaming brutal (sched latency, BBR, dll). Matikan kalau bootloop untuk bisect"
         type: boolean
         default: true
+      teo_idle:
+        description: "CPUIdle governor TEO (latensi wake-up lebih rendah). Nonaktif kalau SoC pakai idle governor vendor"
+        type: boolean
+        default: true
+      polly:
+        description: "Polly loop optimizer di KCFLAGS (otomatis dilewati kalau clang tidak support)"
+        type: boolean
+        default: false
 
 env:
   KERNEL_NAME: Kaelltzyy-Experimental
@@ -298,6 +306,35 @@ jobs:
           echo "--- diff sched (hanya baris berubah) ---"
           git diff -U0 kernel/sched/ | grep -E '^[+-][^+-]' | head -n 60 || true
 
+      - name: Tuning responsif UI (schedutil)
+        if: ${{ inputs.brutal_tuning }}
+        run: |
+          python3 - <<'PY'
+          import re
+          def patch(path, pattern, repl, label):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  print(f"::warning::{label}: {path} tidak ada"); return
+              n, k = re.subn(pattern, repl, s)
+              if k == 0:
+                  print(f"::warning::{label}: pola tidak ketemu (dilewati, tidak fatal)"); return
+              open(path, "w").write(n); print(f"OK {label} ({k}x)")
+
+          # Headroom frekuensi 1.25x -> 1.5x: frekuensi naik lebih awal saat beban naik (scroll/animasi/game)
+          patch("include/linux/sched/cpufreq.h",
+                r"\(freq \+ \(freq >> 2\)\) \* util / cap",
+                "(freq + (freq >> 1)) * util / cap", "schedutil_headroom_1.5x")
+          # Rate limit schedutil maksimal 1ms (default bisa 10ms+): respons naik-turun frekuensi lebih cepat
+          patch("kernel/sched/cpufreq_schedutil.c",
+                r"tunables->rate_limit_us\s*=\s*cpufreq_policy_transition_delay_us\(policy\);",
+                "tunables->rate_limit_us = min_t(unsigned int, cpufreq_policy_transition_delay_us(policy), 1000);",
+                "schedutil_rate_limit_1ms")
+          # vmstat worker tiap 1s -> 5s: lebih sedikit wake-up/jitter di tiap core
+          patch("mm/vmstat.c", r"(sysctl_stat_interval\s+__read_mostly\s*=\s*)HZ;", r"\g<1>(5 * HZ);", "vmstat_interval_5s")
+          PY
+          git diff -U0 include/linux/sched/cpufreq.h kernel/sched/cpufreq_schedutil.c mm/vmstat.c | grep -E '^[+-][^+-]' || true
+
       - name: Info versi kernel
         run: |
           make kernelversion
@@ -365,6 +402,15 @@ jobs:
           # Uclamp (boost task game dari user-space)
           scripts/config --file out/.config -e UCLAMP_TASK -e UCLAMP_TASK_GROUP
 
+          # CPUIdle governor TEO (menu rating 20 > teo 19, jadi menu harus dimatikan)
+          if [ "${{ inputs.teo_idle }}" = "true" ]; then
+            if grep -q "config CPU_IDLE_GOV_TEO" drivers/cpuidle/Kconfig; then
+              scripts/config --file out/.config -e CPU_IDLE -e CPU_IDLE_GOV_TEO -d CPU_IDLE_GOV_MENU -d CPU_IDLE_GOV_LADDER
+            else
+              echo "::warning::CPU_IDLE_GOV_TEO tidak ada di source, dilewati"
+            fi
+          fi
+
           # Matikan power efficient workqueue
           scripts/config --file out/.config -d WQ_POWER_EFFICIENT_DEFAULT
 
@@ -415,7 +461,17 @@ jobs:
           scripts/config --file out/.config -d LOCALVERSION_AUTO
 
           make "${MAKE_ARGS[@]}" olddefconfig
-          make "${MAKE_ARGS[@]}" KCFLAGS="-O3 -Wno-error" -j"$(nproc --all)" Image 2>&1 | tee build.log
+          EXTRA_CFLAGS="-O3 -Wno-error"
+          if [ "${{ inputs.polly }}" = "true" ]; then
+            POLLY="-mllvm -polly -mllvm -polly-run-dce -mllvm -polly-ast-use-context -mllvm -polly-detect-keep-going"
+            if echo 'int x;' | clang $POLLY -x c -c - -o /dev/null 2>/dev/null; then
+              EXTRA_CFLAGS="$EXTRA_CFLAGS $POLLY"; echo "Polly: aktif"
+            else
+              echo "::warning::clang ini tidak support Polly, dilewati"
+            fi
+          fi
+          echo "KCFLAGS: $EXTRA_CFLAGS"
+          make "${MAKE_ARGS[@]}" KCFLAGS="$EXTRA_CFLAGS" -j"$(nproc --all)" Image 2>&1 | tee build.log
 
           ccache -s || true
           test -f out/arch/arm64/boot/Image || { echo "Build gagal: Image tidak ada"; exit 1; }
@@ -424,7 +480,7 @@ jobs:
         run: |
           ls -lh out/arch/arm64/boot/Image
           strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
-          grep -E '^CONFIG_(HZ|PREEMPT|INIT_ON|ZSMALLOC|MITIGATE_SPECTRE|SCHED_DEBUG|SCHEDSTATS|SCHED_BORE|UCLAMP|CC_OPTIMIZE|LOCALVERSION|LTO_CLANG|CFI_CLANG|MODVERSIONS|KSU|KPROBES|WQ_POWER_EFFICIENT|RCU_BOOST|RCU_EXPERT|ZRAM|CRYPTO_LZ4|TCP_CONG_BBR|DEFAULT_TCP_CONG|DEFAULT_BBR|DEFAULT_NET_SCH|DEFAULT_FQ|NET_SCH_FQ|CONSOLE_LOGLEVEL_DEFAULT|CPU_FREQ_GOV_KAELLTZYY|CPU_FREQ_DEFAULT_GOV|LRU_GEN)' out/.config || true
+          grep -E '^CONFIG_(HZ|PREEMPT|INIT_ON|ZSMALLOC|MITIGATE_SPECTRE|SCHED_DEBUG|SCHEDSTATS|SCHED_BORE|UCLAMP|CC_OPTIMIZE|LOCALVERSION|LTO_CLANG|CFI_CLANG|MODVERSIONS|KSU|KPROBES|WQ_POWER_EFFICIENT|RCU_BOOST|RCU_EXPERT|ZRAM|CRYPTO_LZ4|TCP_CONG_BBR|DEFAULT_TCP_CONG|DEFAULT_BBR|DEFAULT_NET_SCH|DEFAULT_FQ|NET_SCH_FQ|CONSOLE_LOGLEVEL_DEFAULT|CPU_FREQ_GOV_KAELLTZYY|CPU_FREQ_DEFAULT_GOV|LRU_GEN|CPU_IDLE_GOV|PAGE_OWNER|DEBUG_LIST|HARDENED_USERCOPY)' out/.config || true
           cp out/.config kaelltzyy.config
 
       - name: Package AnyKernel3
