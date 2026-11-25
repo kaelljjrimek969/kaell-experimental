@@ -1,0 +1,442 @@
+name: Build kaelljagobgt
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Repo source kernel (owner/nama)"
+        required: true
+        default: "kaelljjrimek969/kernel-a12-5.10"
+      source_ref:
+        description: "Branch source kernel"
+        required: true
+        default: "experimental"
+      defconfig:
+        description: "Defconfig (isi sesuai source, mis. gki_defconfig)"
+        required: true
+        default: "gki_defconfig"
+      lto_mode:
+        description: "LTO mode (hindari none di GKI: CFI ikut mati, modul vendor bisa gagal load)"
+        type: choice
+        default: "thin"
+        options:
+          - thin
+          - keep
+          - full
+          - none
+      ksu_enable:
+        description: "Integrasi KernelSU-Next"
+        type: boolean
+        default: true
+      kaelltzyy_default:
+        description: "Jadikan governor kaelltzyy sebagai default"
+        type: boolean
+        default: false
+      brutal_tuning:
+        description: "Tuning gaming brutal (sched latency, BBR, dll). Matikan kalau bootloop untuk bisect"
+        type: boolean
+        default: true
+
+env:
+  KERNEL_NAME: Kaelltzyy-Experimental
+  # Nama yang tampil di HP (uname -r)
+  KERNEL_LOCALVERSION: Kaelltzyy-Experimental
+  ARCH: arm64
+  # KernelSU-Next: branch next = terbaru. Ganti ke tag stabil kalau next gagal build
+  KSU_REPO: KernelSU-Next/KernelSU-Next
+  KSU_BRANCH: next
+  # Kosong = tag stabil terbaru. Isi "next" kalau mau branch dev
+  KSU_REF: ""
+  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3
+  TZ: Asia/Jakarta
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Maksimalkan ruang disk + swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          df -h /
+          free -h
+
+      - name: Install dependensi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git libelf-dev libssl-dev \
+            libncurses-dev lz4 python3 rsync unzip zip xz-utils zstd cpio \
+            libarchive-tools device-tree-compiler
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ inputs.source_repo }}-${{ inputs.source_ref }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.source_repo }}-${{ inputs.source_ref }}-
+
+      - name: Download Neutron clang
+        run: |
+          mkdir -p "$HOME/neutron"
+          cd "$HOME/neutron"
+          bash <(curl -s https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) -S
+          echo "$HOME/neutron/bin" >> "$GITHUB_PATH"
+          "$HOME/neutron/bin/clang" --version | head -n1
+
+      - name: Integrasi KernelSU-Next
+        if: ${{ inputs.ksu_enable }}
+        run: |
+          test -d drivers || { echo "Bukan di root source kernel: $(pwd)"; ls -la; exit 1; }
+          curl -fLSs "https://raw.githubusercontent.com/${KSU_REPO}/${KSU_BRANCH}/kernel/setup.sh" | bash -s ${KSU_REF}
+          ls -la
+
+      - name: Tambah governor Kaelltzyy
+        run: |
+          cat > drivers/cpufreq/cpufreq_kaelltzyy.c <<'EOF'
+          // SPDX-License-Identifier: GPL-2.0-only
+          /*
+           * Governor Kaelltzyy (fork dari governor performance)
+           */
+          #include <linux/cpufreq.h>
+          #include <linux/init.h>
+          #include <linux/module.h>
+          #include <linux/workqueue.h>
+
+          static void cpufreq_gov_kaelltzyy_limits(struct cpufreq_policy *policy)
+          {
+              pr_debug("kaelltzyy: setting to %u kHz\n", policy->max);
+              __cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_H);
+          }
+
+          #ifdef CONFIG_COMPACTION
+          extern void kaelltzyy_compact_memory(void);
+          static void kaelltzyy_compact_fn(struct work_struct *w)
+          {
+              kaelltzyy_compact_memory();
+          }
+          static DECLARE_WORK(kaelltzyy_compact_work, kaelltzyy_compact_fn);
+          #endif
+
+          /* Governor dipilih = mode game mulai -> proactive compaction */
+          static int cpufreq_gov_kaelltzyy_start(struct cpufreq_policy *policy)
+          {
+          #ifdef CONFIG_COMPACTION
+              schedule_work(&kaelltzyy_compact_work);
+          #endif
+              return 0;
+          }
+
+          static struct cpufreq_governor cpufreq_gov_kaelltzyy = {
+              .name   = "kaelltzyy",
+              .owner  = THIS_MODULE,
+              .flags  = CPUFREQ_GOV_STRICT_TARGET,
+              .start  = cpufreq_gov_kaelltzyy_start,
+              .limits = cpufreq_gov_kaelltzyy_limits,
+          };
+
+          #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_KAELLTZYY
+          struct cpufreq_governor *cpufreq_default_governor(void)
+          {
+              return &cpufreq_gov_kaelltzyy;
+          }
+          #endif
+
+          MODULE_AUTHOR("Kaell");
+          MODULE_DESCRIPTION("CPUfreq policy governor 'kaelltzyy'");
+          MODULE_LICENSE("GPL");
+
+          cpufreq_governor_init(cpufreq_gov_kaelltzyy);
+          cpufreq_governor_exit(cpufreq_gov_kaelltzyy);
+          EOF
+
+          # Makefile
+          sed -i '/cpufreq_performance.o/a obj-$(CONFIG_CPU_FREQ_GOV_KAELLTZYY)\t+= cpufreq_kaelltzyy.o' drivers/cpufreq/Makefile
+          grep -n kaelltzyy drivers/cpufreq/Makefile
+
+          # Kconfig
+          python3 - <<'PY'
+          p = "drivers/cpufreq/Kconfig"
+          s = open(p).read()
+          gov = ("config CPU_FREQ_GOV_KAELLTZYY\n"
+                 "\ttristate \"'kaelltzyy' governor\"\n"
+                 "\thelp\n"
+                 "\t  Governor Kaelltzyy, fork dari governor performance.\n\n")
+          dflt = ("config CPU_FREQ_DEFAULT_GOV_KAELLTZYY\n"
+                  "\tbool \"kaelltzyy\"\n"
+                  "\tselect CPU_FREQ_GOV_KAELLTZYY\n"
+                  "\thelp\n"
+                  "\t  Pakai governor 'kaelltzyy' sebagai default.\n\n")
+          a = "config CPU_FREQ_GOV_PERFORMANCE\n"
+          b = "config CPU_FREQ_DEFAULT_GOV_PERFORMANCE\n"
+          assert a in s and b in s, "marker Kconfig tidak ketemu"
+          s = s.replace(a, gov + a, 1).replace(b, dflt + b, 1)
+          open(p, "w").write(s)
+          PY
+          grep -n -i kaelltzyy drivers/cpufreq/Kconfig
+
+      - name: Default VM + ZRAM + proactive compaction
+        run: |
+          python3 - <<'PY'
+          import re
+          def patch(path, pattern, repl, label, count=1):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  print(f"::warning::{label}: {path} tidak ada"); return
+              n, k = re.subn(pattern, repl, s, count=count, flags=re.S)
+              if k == 0:
+                  print(f"::warning::{label}: pola tidak ketemu di {path}"); return
+              open(path, "w").write(n); print(f"OK {label}")
+
+          # Dirty ratio 10%, background 5%
+          patch("mm/page-writeback.c", r"int vm_dirty_ratio = \d+;", "int vm_dirty_ratio = 10;", "dirty_ratio")
+          patch("mm/page-writeback.c", r"int dirty_background_ratio = \d+;", "int dirty_background_ratio = 5;", "dirty_background_ratio")
+          # Writeback interval 3s, expire 5s (centisecs)
+          patch("mm/page-writeback.c", r"(dirty_writeback_interval\s*=\s*)[^;]+;", r"\g<1>3 * 100;", "writeback_interval")
+          patch("mm/page-writeback.c", r"(dirty_expire_interval\s*=\s*)[^;]+;", r"\g<1>5 * 100;", "dirty_expire")
+          # VFS cache pressure 50
+          patch("fs/dcache.c", r"(sysctl_vfs_cache_pressure\s+__read_mostly\s*=\s*)\d+;", r"\g<1>50;", "vfs_cache_pressure")
+          # Swappiness default 20
+          patch("mm/vmscan.c", r"int vm_swappiness = \d+;", "int vm_swappiness = 20;", "swappiness_default")
+          # Min free kbytes +5 MB
+          patch("mm/page_alloc.c",
+                r"(new_min_free_kbytes\s*=\s*int_sqrt\(lowmem_kbytes\s*\*\s*16\);)",
+                r"\g<1>\n\tnew_min_free_kbytes += 5120;", "min_free_kbytes")
+
+          # Watermark scale 30: kswapd bangun lebih awal, kurangi direct reclaim (stutter)
+          patch("mm/page_alloc.c", r"(int watermark_scale_factor\s*=\s*)\d+;", r"\g<1>30;", "watermark_scale_factor")
+          # Watermark boost off: kswapd tidak agresif reclaim berlebihan setelah fragmentasi
+          patch("mm/page_alloc.c", r"(int watermark_boost_factor[^=;]*=\s*)\d+;", r"\g<1>0;", "watermark_boost_factor")
+          # Tanpa dump semua task saat OOM (hindari stall panjang)
+          patch("mm/oom_kill.c", r"(int sysctl_oom_dump_tasks\s*=\s*)\d+;", r"\g<1>0;", "oom_dump_tasks")
+          # max_map_count 262144: game besar (Unity/Unreal) tidak mentok limit mmap
+          patch("include/linux/mm.h",
+                r"(#define DEFAULT_MAX_MAP_COUNT\s+)\(USHRT_MAX - MAPCOUNT_ELF_CORE_MARGIN\)",
+                r"\g<1>262144", "max_map_count")
+          # Read-ahead I/O 512KB (default 128KB): loading asset/map game lebih cepat
+          patch("include/linux/mm.h", r"(VM_READAHEAD_PAGES\s+\(SZ_)128K", r"\g<1>512K", "readahead_512k")
+          # ZRAM: paksa lz4 walau Android/vendor menulis algoritma lain (fallback aman kalau lz4 tidak tersedia)
+          patch("drivers/block/zram/zram_drv.c",
+                r'strcpy\(zram->compressor, compressor\);',
+                'strcpy(zram->compressor, zcomp_available_algorithm("lz4") ? "lz4" : compressor);',
+                "zram_force_lz4")
+          # Page cluster 0: tanpa swap readahead (percuma di zram)
+          patch("mm/swap.c", r"page_cluster = \d+;", "page_cluster = 0;", "page_cluster", count=0)
+
+          # Proactive compaction: helper dipanggil governor kaelltzyy saat start
+          try:
+              c = open("mm/compaction.c").read()
+              if "kaelltzyy_compact_memory" not in c:
+                  c += """
+          #ifdef CONFIG_COMPACTION
+          void kaelltzyy_compact_memory(void)
+          {
+          	compact_nodes();
+          }
+          EXPORT_SYMBOL_GPL(kaelltzyy_compact_memory);
+          #endif
+          """
+                  open("mm/compaction.c", "w").write(c); print("OK compact helper")
+          except Exception as e:
+              print("::warning::compact helper gagal:", e)
+          PY
+
+      - name: Tuning gaming brutal (source scheduler)
+        if: ${{ inputs.brutal_tuning }}
+        run: |
+          python3 - <<'PY'
+          import re
+          def patch(paths, pattern, repl, label):
+              done = False
+              for path in paths:
+                  try:
+                      s = open(path).read()
+                  except FileNotFoundError:
+                      continue
+                  n, k = re.subn(pattern, repl, s)
+                  if k:
+                      open(path, "w").write(n)
+                      print(f"OK {label} ({path}, {k}x)")
+                      done = True
+              if not done:
+                  print(f"::warning::{label}: pola tidak ketemu (dilewati, tidak fatal)")
+
+          sched = ["kernel/sched/fair.c", "kernel/sched/core.c", "kernel/sched/sched.h"]
+          # Latency scheduler lebih rapat: respons input/frame lebih cepat
+          patch(sched, r"(sysctl_sched_latency\s*=\s*)\d+(?:ULL|UL);", r"\g<1>3000000ULL;", "sched_latency 3ms")
+          patch(sched, r"(sysctl_sched_min_granularity\s*=\s*)\d+(?:ULL|UL);", r"\g<1>400000ULL;", "sched_min_granularity 0.4ms")
+          patch(sched, r"(sysctl_sched_wakeup_granularity\s*=\s*)\d+(?:ULL|UL);", r"\g<1>500000UL;", "sched_wakeup_granularity 0.5ms")
+          # Task lebih cepat boleh migrasi antar core
+          patch(sched, r"(sysctl_sched_migration_cost\s*=\s*)\d+(?:ULL|UL);", r"\g<1>200000UL;", "sched_migration_cost 0.2ms")
+          # EAS off: scheduler tidak lagi menimbang hemat energi, task game lebih sering ke core besar
+          patch(["kernel/sched/topology.c"], r"(sysctl_sched_energy_aware\s*=\s*)1;", r"\g<1>0;", "eas_off")
+          # TCP: jangan reset congestion window setelah koneksi idle (game online, lompat ping)
+          patch(["net/ipv4/tcp_ipv4.c"], r"(sysctl_tcp_slow_start_after_idle\s*=\s*)1;", r"\g<1>0;", "tcp_slow_start_after_idle_off")
+          # BORE: toleransi burst 22 -> 24 (~4ms -> ~16ms): thread game yang jalan ~1 frame tidak dipenalti prioritasnya
+          patch(["kernel/sched/fair.c"], r"(sched_burst_penalty_offset\s*=\s*)\d+;", r"\g<1>24;", "bore_penalty_offset 24")
+          PY
+          echo "--- ringkasan perubahan source ---"
+          git status --short | head -n 30 || true
+          git diff --stat | tail -n 20 || true
+          echo "--- diff sched (hanya baris berubah) ---"
+          git diff -U0 kernel/sched/ | grep -E '^[+-][^+-]' | head -n 60 || true
+
+      - name: Info versi kernel
+        run: |
+          make kernelversion
+          git log -3 --oneline || true
+          echo "--- BORE ---"
+          grep -rn "SCHED_BORE" init/Kconfig kernel/sched/Kconfig 2>/dev/null | head -3 || true
+          echo "--- BORE tunables (nama parameter) ---"
+          grep -rn "burst" kernel/sched/fair.c kernel/sysctl.c include/linux/sched.h 2>/dev/null | head -n 40 || true
+          echo "--- BBR ---"
+          grep -n -i "bbrv3\|BBR v3" net/ipv4/tcp_bbr.c | head -3 || true
+
+      - name: Build kernel
+        run: |
+          set -o pipefail
+          export PATH="$HOME/neutron/bin:$PATH"
+          export CCACHE_DIR="$HOME/.ccache"
+          export CCACHE_MAXSIZE=5G
+          export CCACHE_BASEDIR="$PWD"
+          export KBUILD_BUILD_USER="kaell"
+          export KBUILD_BUILD_HOST="github-actions"
+          ccache -z || true
+
+          MAKE_ARGS=(ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            CC="ccache clang")
+
+          make "${MAKE_ARGS[@]}" ${{ inputs.defconfig }}
+
+          # LTO
+          case "${{ inputs.lto_mode }}" in
+            keep)
+              echo "LTO: ikut defconfig"
+              ;;
+            thin)
+              scripts/config --file out/.config -d LTO_NONE -d LTO_CLANG_FULL -e LTO_CLANG_THIN
+              ;;
+            full)
+              scripts/config --file out/.config -d LTO_NONE -d LTO_CLANG_THIN -e LTO_CLANG_FULL
+              ;;
+            none)
+              scripts/config --file out/.config -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL
+              ;;
+          esac
+
+          # MGLRU (sudah di-merge dari Arkael mglru-5.10)
+          scripts/config --file out/.config -e LRU_GEN -e LRU_GEN_ENABLED -d LRU_GEN_STATS
+
+          # Governor Kaelltzyy (built-in, bukan module)
+          scripts/config --file out/.config -e CPU_FREQ_GOV_KAELLTZYY
+          if [ "${{ inputs.kaelltzyy_default }}" = "true" ]; then
+            scripts/config --file out/.config -d CPU_FREQ_DEFAULT_GOV_SCHEDUTIL -e CPU_FREQ_DEFAULT_GOV_KAELLTZYY
+          fi
+
+          # ZRAM + lz4 built-in (=y) supaya tidak butuh module
+          scripts/config --file out/.config \
+            -e ZRAM -e CRYPTO_LZ4 -e CRYPTO_LZ4HC -e LZ4_COMPRESS -e LZ4_DECOMPRESS \
+            -d ZRAM_DEF_COMP_LZORLE -d ZRAM_DEF_COMP_LZO -d ZRAM_DEF_COMP_ZSTD \
+            -d ZRAM_DEF_COMP_LZ4HC -d ZRAM_DEF_COMP_842 \
+            -e ZRAM_DEF_COMP_LZ4
+          scripts/config --file out/.config -e COMPACTION
+
+          # Timer frequency 1000 Hz
+          scripts/config --file out/.config -d HZ_100 -d HZ_250 -d HZ_300 -e HZ_1000 --set-val HZ 1000
+
+          # Uclamp (boost task game dari user-space)
+          scripts/config --file out/.config -e UCLAMP_TASK -e UCLAMP_TASK_GROUP
+
+          # Matikan power efficient workqueue
+          scripts/config --file out/.config -d WQ_POWER_EFFICIENT_DEFAULT
+
+          # RCU priority boost (butuh RCU_EXPERT)
+          scripts/config --file out/.config -e RCU_EXPERT -e RCU_BOOST --set-val RCU_BOOST_DELAY 500
+
+          # Optimasi -O3 (kalau symbol ada di source; KCFLAGS di bawah jadi fallback)
+          if grep -q "CC_OPTIMIZE_FOR_PERFORMANCE_O3" init/Kconfig; then
+            scripts/config --file out/.config -d CC_OPTIMIZE_FOR_PERFORMANCE -e CC_OPTIMIZE_FOR_PERFORMANCE_O3
+          fi
+
+          # ===== Tuning gaming brutal (semua built-in, tanpa module) =====
+          if [ "${{ inputs.brutal_tuning }}" = "true" ]; then
+            # TCP BBR (v3 dari source) jadi default: ping game lebih stabil
+            scripts/config --file out/.config -e TCP_CONG_ADVANCED -e TCP_CONG_BBR \
+              -d DEFAULT_CUBIC -d DEFAULT_RENO -e DEFAULT_BBR --set-str DEFAULT_TCP_CONG "bbr"
+
+            # Qdisc default fq: pacing rapi berpasangan dengan BBR
+            scripts/config --file out/.config -e NET_SCH_FQ \
+              -d DEFAULT_PFIFO_FAST -d DEFAULT_FQ_CODEL -d DEFAULT_SFQ -e DEFAULT_FQ \
+              --set-str DEFAULT_NET_SCH "fq"
+
+            # Loglevel console kecil: printk tidak makan CPU
+            scripts/config --file out/.config --set-val CONSOLE_LOGLEVEL_DEFAULT 4
+
+            # BORE scheduler aktif kalau symbol-nya ada di source
+            if grep -rq "config SCHED_BORE" init/Kconfig kernel/sched/Kconfig 2>/dev/null; then
+              scripts/config --file out/.config -e SCHED_BORE
+            fi
+
+            # Memori: matikan zeroing halaman tiap alloc/free + tracking zram (overhead tanpa guna di HP)
+            scripts/config --file out/.config -d INIT_ON_ALLOC_DEFAULT_ON -d INIT_ON_FREE_DEFAULT_ON -d ZRAM_MEMORY_TRACKING
+
+            # Statistik zsmalloc (debug) off + mitigasi Spectre-BHB off (overhead tiap syscall di core A76)
+            scripts/config --file out/.config -d ZSMALLOC_STAT -d MITIGATE_SPECTRE_BRANCH_HISTORY
+
+            # Preempt penuh untuk latensi input/frame terendah
+            scripts/config --file out/.config -d PREEMPT_NONE -d PREEMPT_VOLUNTARY -e PREEMPT
+          fi
+
+          # KernelSU-Next (hook pakai kprobe)
+          if [ "${{ inputs.ksu_enable }}" = "true" ]; then
+            scripts/config --file out/.config -e KSU -e KPROBES -e KPROBE_EVENTS
+          fi
+
+          # Nama kernel
+          scripts/config --file out/.config --set-str LOCALVERSION "-${KERNEL_LOCALVERSION}"
+          scripts/config --file out/.config -d LOCALVERSION_AUTO
+
+          make "${MAKE_ARGS[@]}" olddefconfig
+          make "${MAKE_ARGS[@]}" KCFLAGS="-O3 -Wno-error" -j"$(nproc --all)" Image 2>&1 | tee build.log
+
+          ccache -s || true
+          test -f out/arch/arm64/boot/Image || { echo "Build gagal: Image tidak ada"; exit 1; }
+
+      - name: Cek hasil build
+        run: |
+          ls -lh out/arch/arm64/boot/Image
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
+          grep -E '^CONFIG_(HZ|PREEMPT|INIT_ON|ZSMALLOC|MITIGATE_SPECTRE|SCHED_DEBUG|SCHEDSTATS|SCHED_BORE|UCLAMP|CC_OPTIMIZE|LOCALVERSION|LTO_CLANG|CFI_CLANG|MODVERSIONS|KSU|KPROBES|WQ_POWER_EFFICIENT|RCU_BOOST|RCU_EXPERT|ZRAM|CRYPTO_LZ4|TCP_CONG_BBR|DEFAULT_TCP_CONG|DEFAULT_BBR|DEFAULT_NET_SCH|DEFAULT_FQ|NET_SCH_FQ|CONSOLE_LOGLEVEL_DEFAULT|CPU_FREQ_GOV_KAELLTZYY|CPU_FREQ_DEFAULT_GOV|LRU_GEN)' out/.config || true
+          cp out/.config kaelltzyy.config
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 "$ANYKERNEL_REPO" ak3
+          rm -rf ak3/.git ak3/README.md
+          cp out/arch/arm64/boot/Image ak3/Image
+          DATE=$(date +%Y%m%d-%H%M)
+          echo "ZIP_NAME=${KERNEL_NAME}-${DATE}" >> "$GITHUB_ENV"
+          # anykernel.sh sama seperti workflow lama yang berhasil boot:
+          # tanpa cek device, hanya ganti kernel (split_boot + flash_boot, ramdisk tidak dibongkar)
+          cat > ak3/anykernel.sh <<'AK
