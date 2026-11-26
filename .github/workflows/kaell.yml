@@ -221,8 +221,8 @@ jobs:
           patch("mm/page-writeback.c", r"(dirty_expire_interval\s*=\s*)[^;]+;", r"\g<1>5 * 100;", "dirty_expire")
           # VFS cache pressure 50
           patch("fs/dcache.c", r"(sysctl_vfs_cache_pressure\s+__read_mostly\s*=\s*)\d+;", r"\g<1>50;", "vfs_cache_pressure")
-          # Swappiness default 20
-          patch("mm/vmscan.c", r"int vm_swappiness = \d+;", "int vm_swappiness = 20;", "swappiness_default")
+          # Swappiness default 60: dengan zram, swap murah; swappiness rendah malah memaksa cache file/asset game dibuang lalu dibaca ulang (stutter)
+          patch("mm/vmscan.c", r"int vm_swappiness = \d+;", "int vm_swappiness = 60;", "swappiness_default")
           # Min free kbytes +5 MB
           patch("mm/page_alloc.c",
                 r"(new_min_free_kbytes\s*=\s*int_sqrt\(lowmem_kbytes\s*\*\s*16\);)",
@@ -321,10 +321,6 @@ jobs:
                   print(f"::warning::{label}: pola tidak ketemu (dilewati, tidak fatal)"); return
               open(path, "w").write(n); print(f"OK {label} ({k}x)")
 
-          # Headroom frekuensi 1.25x -> 1.5x: frekuensi naik lebih awal saat beban naik (scroll/animasi/game)
-          patch("include/linux/sched/cpufreq.h",
-                r"\(freq \+ \(freq >> 2\)\) \* util / cap",
-                "(freq + (freq >> 1)) * util / cap", "schedutil_headroom_1.5x")
           # Rate limit schedutil maksimal 1ms (default bisa 10ms+): respons naik-turun frekuensi lebih cepat
           patch("kernel/sched/cpufreq_schedutil.c",
                 r"tunables->rate_limit_us\s*=\s*cpufreq_policy_transition_delay_us\(policy\);",
@@ -332,8 +328,29 @@ jobs:
                 "schedutil_rate_limit_1ms")
           # vmstat worker tiap 1s -> 5s: lebih sedikit wake-up/jitter di tiap core
           patch("mm/vmstat.c", r"(sysctl_stat_interval\s+__read_mostly\s*=\s*)HZ;", r"\g<1>(5 * HZ);", "vmstat_interval_5s")
+          # TCP autocorking off: paket kecil (input/chat game via TCP) tidak ditahan menunggu digabung
+          patch("net/ipv4/tcp_ipv4.c", r"(net->ipv4\.sysctl_tcp_autocorking\s*=\s*)1;", r"\g<1>0;", "tcp_autocorking_off")
+
+          # BORE: penalti burst skala 1.25x -> 1.0x, thread game yang berat tidak terlalu diturunkan prioritasnya
+          patch("kernel/sched/fair.c", r"(sched_burst_penalty_scale\s*=\s*)\d+;", r"\g<1>1024;", "bore_penalty_scale_1024")
+          # Timer migration off: timer tidak dilempar ke core lain (kurangi IPI/wake-up antar core)
+          patch("kernel/time/timer.c", r"(sysctl_timer_migration\s*=\s*)1;", r"\g<1>0;", "timer_migration_off")
+          # F2FS GC thread tidur lebih lama (kurangi aktivitas tulis di background)
+          patch("fs/f2fs/gc.h", r"(#define\s+DEF_GC_THREAD_MIN_SLEEP_TIME\s+)30000", r"\g<1>60000", "f2fs_gc_min_sleep_60s")
+          patch("fs/f2fs/gc.h", r"(#define\s+DEF_GC_THREAD_MAX_SLEEP_TIME\s+)60000", r"\g<1>120000", "f2fs_gc_max_sleep_120s")
+          # Proactive compaction 20 -> 10: kerja kompaksi latar kernel dikurangi setengah
+          patch("mm/compaction.c", r"(sysctl_compaction_proactiveness\s*=\s*)20;", r"\g<1>10;", "compaction_proactiveness_10")
+          # TCP: batasi data belum terkirim di buffer 256KB (kurangi bufferbloat saat upload)
+          patch("net/ipv4/tcp_ipv4.c", r"(sysctl_tcp_notsent_lowat\s*=\s*)UINT_MAX;", r"\g<1>262144;", "tcp_notsent_lowat_256k")
+          # Buffer socket default 2x (UDP burst tidak mudah drop)
+          patch("net/core/sock.c", r"(sysctl_rmem_default\s+__read_mostly\s*=\s*)SK_RMEM_MAX;", r"\g<1>(SK_RMEM_MAX * 2);", "rmem_default_2x")
+          patch("net/core/sock.c", r"(sysctl_wmem_default\s+__read_mostly\s*=\s*)SK_WMEM_MAX;", r"\g<1>(SK_WMEM_MAX * 2);", "wmem_default_2x")
+          # Child runs first: proses/thread baru langsung jalan setelah fork (buka app lebih sigap)
+          patch("kernel/sched/fair.c", r"(unsigned int\s+sysctl_sched_child_runs_first\s+__read_mostly)\s*;", r"\g<1> = 1;", "child_runs_first")
+          # Budget softirq jaringan 300 -> 600
+          patch("net/core/dev.c", r"(int\s+netdev_budget\s+__read_mostly\s*=\s*)300;", r"\g<1>600;", "netdev_budget_600")
           PY
-          git diff -U0 include/linux/sched/cpufreq.h kernel/sched/cpufreq_schedutil.c mm/vmstat.c | grep -E '^[+-][^+-]' || true
+          git diff -U0 kernel/sched/cpufreq_schedutil.c mm/vmstat.c net/ipv4/tcp_ipv4.c kernel/sched/fair.c kernel/time/timer.c fs/f2fs/gc.h mm/compaction.c net/core/sock.c net/core/dev.c | grep -E '^[+-][^+-]' || true
 
       - name: Info versi kernel
         run: |
