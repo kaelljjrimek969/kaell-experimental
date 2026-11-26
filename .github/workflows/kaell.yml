@@ -125,7 +125,41 @@ jobs:
           #include <linux/cpufreq.h>
           #include <linux/init.h>
           #include <linux/module.h>
+          #include <linux/mutex.h>
           #include <linux/workqueue.h>
+
+          /* Tunable scheduler (non-static di kernel/sched/fair.c) */
+          extern unsigned int sysctl_sched_latency;
+          extern unsigned int sysctl_sched_min_granularity;
+          extern unsigned int sysctl_sched_wakeup_granularity;
+
+          /* Nilai scheduler saat mode game aktif (ns) */
+          #define KAELLTZYY_SCHED_LATENCY		3000000U
+          #define KAELLTZYY_SCHED_MIN_GRAN	400000U
+          #define KAELLTZYY_SCHED_WAKEUP_GRAN	500000U
+
+          static DEFINE_MUTEX(kaelltzyy_lock);
+          static unsigned int kaelltzyy_users;	/* jumlah policy yang memakai governor ini */
+          static unsigned int saved_latency, saved_min_gran, saved_wakeup_gran;
+
+          static void kaelltzyy_game_on(void)
+          {
+              saved_latency = sysctl_sched_latency;
+              saved_min_gran = sysctl_sched_min_granularity;
+              saved_wakeup_gran = sysctl_sched_wakeup_granularity;
+              sysctl_sched_latency = KAELLTZYY_SCHED_LATENCY;
+              sysctl_sched_min_granularity = KAELLTZYY_SCHED_MIN_GRAN;
+              sysctl_sched_wakeup_granularity = KAELLTZYY_SCHED_WAKEUP_GRAN;
+              pr_info("kaelltzyy: mode game ON\n");
+          }
+
+          static void kaelltzyy_game_off(void)
+          {
+              sysctl_sched_latency = saved_latency;
+              sysctl_sched_min_granularity = saved_min_gran;
+              sysctl_sched_wakeup_granularity = saved_wakeup_gran;
+              pr_info("kaelltzyy: mode game OFF, scheduler dikembalikan\n");
+          }
 
           static void cpufreq_gov_kaelltzyy_limits(struct cpufreq_policy *policy)
           {
@@ -142,13 +176,29 @@ jobs:
           static DECLARE_WORK(kaelltzyy_compact_work, kaelltzyy_compact_fn);
           #endif
 
-          /* Governor dipilih = mode game mulai -> proactive compaction */
+          /*
+           * Governor dipilih = mode game mulai: scheduler dirapatkan + proactive compaction.
+           * Governor diganti = scheduler dikembalikan ke nilai semula.
+           * Ada satu start/stop per policy (cluster), jadi pakai penghitung.
+           */
           static int cpufreq_gov_kaelltzyy_start(struct cpufreq_policy *policy)
           {
+              mutex_lock(&kaelltzyy_lock);
+              if (kaelltzyy_users++ == 0)
+                  kaelltzyy_game_on();
+              mutex_unlock(&kaelltzyy_lock);
           #ifdef CONFIG_COMPACTION
               schedule_work(&kaelltzyy_compact_work);
           #endif
               return 0;
+          }
+
+          static void cpufreq_gov_kaelltzyy_stop(struct cpufreq_policy *policy)
+          {
+              mutex_lock(&kaelltzyy_lock);
+              if (kaelltzyy_users && --kaelltzyy_users == 0)
+                  kaelltzyy_game_off();
+              mutex_unlock(&kaelltzyy_lock);
           }
 
           static struct cpufreq_governor cpufreq_gov_kaelltzyy = {
@@ -156,6 +206,7 @@ jobs:
               .owner  = THIS_MODULE,
               .flags  = CPUFREQ_GOV_STRICT_TARGET,
               .start  = cpufreq_gov_kaelltzyy_start,
+              .stop   = cpufreq_gov_kaelltzyy_stop,
               .limits = cpufreq_gov_kaelltzyy_limits,
           };
 
@@ -221,8 +272,8 @@ jobs:
           patch("mm/page-writeback.c", r"(dirty_expire_interval\s*=\s*)[^;]+;", r"\g<1>5 * 100;", "dirty_expire")
           # VFS cache pressure 50
           patch("fs/dcache.c", r"(sysctl_vfs_cache_pressure\s+__read_mostly\s*=\s*)\d+;", r"\g<1>50;", "vfs_cache_pressure")
-          # Swappiness default 60: dengan zram, swap murah; swappiness rendah malah memaksa cache file/asset game dibuang lalu dibaca ulang (stutter)
-          patch("mm/vmscan.c", r"int vm_swappiness = \d+;", "int vm_swappiness = 60;", "swappiness_default")
+          # Swappiness default 35
+          patch("mm/vmscan.c", r"int vm_swappiness = \d+;", "int vm_swappiness = 35;", "swappiness_default")
           # Min free kbytes +5 MB
           patch("mm/page_alloc.c",
                 r"(new_min_free_kbytes\s*=\s*int_sqrt\(lowmem_kbytes\s*\*\s*16\);)",
@@ -241,9 +292,10 @@ jobs:
           # Read-ahead I/O 512KB (default 128KB): loading asset/map game lebih cepat
           patch("include/linux/mm.h", r"(VM_READAHEAD_PAGES\s+\(SZ_)128K", r"\g<1>512K", "readahead_512k")
           # ZRAM: paksa lz4 walau Android/vendor menulis algoritma lain (fallback aman kalau lz4 tidak tersedia)
+          # (cocok untuk strcpy maupun strlcpy; di 5.10 biasanya strlcpy(..., sizeof(compressor)))
           patch("drivers/block/zram/zram_drv.c",
-                r'strcpy\(zram->compressor, compressor\);',
-                'strcpy(zram->compressor, zcomp_available_algorithm("lz4") ? "lz4" : compressor);',
+                r'str[l]?cpy\(zram->compressor,\s*compressor(?:,\s*sizeof\([^)]*\))?\);',
+                'strlcpy(zram->compressor, zcomp_available_algorithm("lz4") ? "lz4" : compressor, sizeof(zram->compressor));',
                 "zram_force_lz4")
           # Page cluster 0: tanpa swap readahead (percuma di zram)
           patch("mm/swap.c", r"page_cluster = \d+;", "page_cluster = 0;", "page_cluster", count=0)
@@ -287,10 +339,9 @@ jobs:
                   print(f"::warning::{label}: pola tidak ketemu (dilewati, tidak fatal)")
 
           sched = ["kernel/sched/fair.c", "kernel/sched/core.c", "kernel/sched/sched.h"]
-          # Latency scheduler lebih rapat: respons input/frame lebih cepat
-          patch(sched, r"(sysctl_sched_latency\s*=\s*)\d+(?:ULL|UL);", r"\g<1>3000000ULL;", "sched_latency 3ms")
-          patch(sched, r"(sysctl_sched_min_granularity\s*=\s*)\d+(?:ULL|UL);", r"\g<1>400000ULL;", "sched_min_granularity 0.4ms")
-          patch(sched, r"(sysctl_sched_wakeup_granularity\s*=\s*)\d+(?:ULL|UL);", r"\g<1>500000UL;", "sched_wakeup_granularity 0.5ms")
+          # sched_latency / min_granularity / wakeup_granularity TIDAK dipatch di sini lagi:
+          # nilai gaming (3ms / 0.4ms / 0.5ms) sekarang hanya aktif saat governor kaelltzyy dipilih
+          # (lihat cpufreq_kaelltzyy.c), jadi di luar game scheduler tetap normal.
           # Task lebih cepat boleh migrasi antar core
           patch(sched, r"(sysctl_sched_migration_cost\s*=\s*)\d+(?:ULL|UL);", r"\g<1>200000UL;", "sched_migration_cost 0.2ms")
           # EAS off: scheduler tidak lagi menimbang hemat energi, task game lebih sering ke core besar
